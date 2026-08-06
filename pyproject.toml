@@ -1,13 +1,14 @@
 [project]
 name = "mcp-server-appwrite"
-version = "0.8.4"
+dynamic = ["version"]
 description = "MCP (Model Context Protocol) server for Appwrite"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "appwrite>=21.0.0,<22",
+    "anyio>=4.0.0",
+    "appwrite>=22.2.0,<23",
     "docstring-parser>=0.16",
-    "mcp[cli]>=1.12.0",
+    "mcp[cli]>=2,<3",
     "python-dotenv>=1.0.1",
     "starlette>=0.40.0",
     "uvicorn[standard]>=0.30.0",
@@ -15,9 +16,10 @@ dependencies = [
     "pyjwt[crypto]>=2.9.0",
     "numpy>=2.0",
     "openai>=1.40",
-    "opentelemetry-api>=1.27",
-    "opentelemetry-sdk>=1.27",
-    "opentelemetry-exporter-otlp-proto-http>=1.27",
+    "opentelemetry-api>=1.28",
+    "opentelemetry-sdk>=1.28",
+    "opentelemetry-exporter-otlp-proto-http>=1.28",
+    "sentry-sdk[starlette]>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -42,7 +44,10 @@ mcp-server-appwrite = "mcp_server_appwrite.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 # Ship the prebuilt docs search index (non-.py package data) in the wheel.
-artifacts = ["src/mcp_server_appwrite/data/*"]
+artifacts = ["src/mcp_server_appwrite/data/*", "src/mcp_server_appwrite/assets/*"]
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.black]
 target-version = ["py312"]
@@ -65,5 +70,5 @@ venv = ".venv"
 typeCheckingMode = "basic"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"

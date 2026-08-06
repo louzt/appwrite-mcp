@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+server.json
 
 # Virtual environments
 .venv
@@ -13,3 +14,6 @@ wheels/
 .vscode
 
 .env
+# Playwright MCP artifacts
+.playwright-mcp/
+.DS_Store

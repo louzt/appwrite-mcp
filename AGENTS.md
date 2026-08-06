@@ -10,7 +10,8 @@ operator-style tools, supporting two deployments from one codebase:
 
 - **Cloud (hosted HTTP):** a Starlette ASGI app that acts as an OAuth 2.1
   Resource Server. It validates the client's bearer token and forwards it to the
-  Appwrite REST API. Served at `mcp.appwrite.io/mcp`.
+  Appwrite REST API. Served primarily at `mcp.appwrite.io/`, with `/mcp` also
+  available as a conventional alias.
 - **Self-hosted (`stdio`):** runs locally and authenticates with a project API
   key (`APPWRITE_PROJECT_ID`, `APPWRITE_API_KEY`, `APPWRITE_ENDPOINT`).
 
@@ -23,8 +24,9 @@ Source lives in `src/mcp_server_appwrite/`:
 | File | Responsibility |
 | --- | --- |
 | `__main__.py` / `server.py` | Entry point, CLI args, transport selection (`--transport stdio\|http`), service registration, low-level MCP server. |
-| `http_app.py` | Hosted Streamable-HTTP transport: `/mcp`, RFC 9728 protected-resource metadata, `/healthz`. |
+| `http_app.py` | Hosted Streamable-HTTP transport: `/` plus the `/mcp` alias, RFC 9728 protected-resource metadata, `/healthz`. |
 | `auth.py` | OAuth 2.1 resource-server layer — bearer-token validation against the project's Appwrite authorization server. |
+| `flags.py` | Central registry of tester/testing flags (CLI arg + env var per flag). Enabling and testing them is documented in [docs/flags.md](docs/flags.md). |
 | `service.py` | `Service` base class: introspects an Appwrite SDK service and turns its methods into MCP tool definitions. |
 | `tool_manager.py` | Registry of all services and their generated tools. |
 | `operator.py` | The compact "operator" surface — `appwrite_search_tools`, `appwrite_call_tool`, result/resource storage, write confirmation. |
@@ -70,7 +72,7 @@ APPWRITE_PROJECT_ID=<id> APPWRITE_API_KEY=<key> \
   uv run mcp-server-appwrite
 
 # Or via Docker (hosted HTTP/OAuth)
-docker compose up --build    # compose.yaml; endpoint at http://localhost:8000/mcp
+docker compose up --build    # compose.yaml; endpoint at http://localhost:8000/
 ```
 
 ## Pre-PR checklist
@@ -143,6 +145,20 @@ OPENAI_API_KEY=sk-... uv run python scripts/build_docs_index.py
 
 These are not gated on PRs the way `ci.yml` is, but be mindful when touching the
 `Dockerfile`, `pyproject.toml` version, or deployment config.
+
+### Release metadata
+
+Release versions come from Git tags. Publish GitHub releases with tags in the
+form `vMAJOR.MINOR.PATCH` (for example, `v0.8.8`). Python package builds derive
+their version from the tag via Hatch VCS, and `server.json` is generated from
+`server.template.json` during the publish workflow before sending metadata to the
+MCP Registry.
+
+Do not hand-edit a version in `pyproject.toml`, `constants.py`, or `server.json`.
+For local registry metadata checks, render the generated file explicitly:
+```bash
+uv run python scripts/render_server_json.py 0.8.8
+```
 
 ## Conventions
 

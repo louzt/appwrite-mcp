@@ -6,10 +6,11 @@ authorization server and then lets the request proceed. The same token is later
 forwarded to the Appwrite REST API, which natively accepts it.
 
 This deployment is single-tenant: it serves one Appwrite project — the Cloud
-console project by default, overridable via ``APPWRITE_PROJECT_ID`` — so the MCP
-endpoint is simply ``/mcp`` with no project in the path. Tokens must be issued by
-that project's authorization server (``<endpoint>/oauth2/<project_id>``); a token
-whose issuer names any other project is rejected.
+console project by default, overridable via ``APPWRITE_PROJECT_ID`` — at the root
+endpoint, with ``/mcp`` also available as a conventional alias. Tokens must be
+issued by that project's authorization server
+(``<endpoint>/oauth2/<project_id>``); a token whose issuer names any other project
+is rejected.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from anyio import to_thread
 from jwt import PyJWKClient
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
-from . import telemetry
+from . import flags
 from .constants import (
     CACHE_TTL_SECONDS,
     DEFAULT_ENDPOINT,
@@ -60,15 +61,60 @@ def issuer_url() -> str:
     return f"{appwrite_endpoint()}/oauth2/{configured_project_id()}"
 
 
+def console_url() -> str | None:
+    """Tester override: base URL of an alternative Appwrite Console (for example
+    ``https://new.appwrite.io``). When set, the MCP server proxies the OAuth
+    authorize step and sends users to this console's login/consent pages instead
+    of the console the authorization server redirects to by default. Token,
+    registration, and JWKS endpoints stay on the real authorization server, so
+    token validation is unaffected. See ``docs/flags.md``."""
+    return flags.value(flags.CONSOLE_URL)
+
+
+def local_authorize_endpoint() -> str:
+    """The MCP-hosted authorize proxy used when a console override is active."""
+    return f"{public_base_url()}/oauth2/authorize"
+
+
+def proxied_authorization_server_metadata(metadata: dict) -> dict:
+    """Rewrite upstream authorization-server metadata for the console override.
+
+    The MCP server presents itself as the authorization server (so clients hit
+    the local authorize proxy, which forwards to the real authorize endpoint and
+    rewrites the consent redirect to the override console); every other endpoint
+    is served verbatim from the upstream document."""
+    rewritten = dict(metadata)
+    rewritten["issuer"] = public_base_url()
+    rewritten["authorization_endpoint"] = local_authorize_endpoint()
+    return rewritten
+
+
 def canonical_resource() -> str:
     """RFC 8707 canonical resource URI for this MCP server."""
+    return f"{public_base_url()}/"
+
+
+def mcp_path_resource() -> str:
+    """Resource URI for clients that use the conventional ``/mcp`` path."""
     return f"{public_base_url()}/mcp"
 
 
-def resource_metadata_url() -> str:
+def accepted_resources() -> tuple[str, str]:
+    """Resource audiences accepted by the two shared MCP endpoints."""
+    return canonical_resource(), mcp_path_resource()
+
+
+def resource_metadata_url(resource: str | None = None) -> str:
     """RFC 9728 protected-resource metadata URL (well-known path + resource path)."""
+    resource = resource or canonical_resource()
+    if resource == canonical_resource():
+        path = "/.well-known/oauth-protected-resource"
+    elif resource == mcp_path_resource():
+        path = "/.well-known/oauth-protected-resource/mcp"
+    else:
+        raise ValueError(f"Unsupported MCP resource: {resource}")
+
     parts = urlsplit(public_base_url())
-    path = "/.well-known/oauth-protected-resource/mcp"
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
@@ -82,6 +128,7 @@ def preferred_scopes() -> list[str]:
 # scope model) propagate without a redeploy; if a refresh fails, the stale copy
 # keeps serving so an authorization-server blip doesn't take the MCP down.
 _discovery_cache: dict[str, tuple[float, dict]] = {}
+_deprecated_scope_cache: dict[str, tuple[float, set[str]]] = {}
 
 
 def _cached_discovery(project_id: str, *, allow_stale: bool = False) -> dict | None:
@@ -96,6 +143,24 @@ def _cached_discovery(project_id: str, *, allow_stale: bool = False) -> dict | N
 
 def _store_discovery(project_id: str, document: dict) -> None:
     _discovery_cache[project_id] = (time.monotonic(), document)
+
+
+def _scope_catalog_cache_key(kind: str) -> str:
+    return f"{appwrite_endpoint()}:{kind}"
+
+
+def _cached_deprecated_scopes(kind: str) -> set[str] | None:
+    entry = _deprecated_scope_cache.get(_scope_catalog_cache_key(kind))
+    if entry is None:
+        return None
+    fetched_at, scopes = entry
+    if time.monotonic() - fetched_at < CACHE_TTL_SECONDS:
+        return scopes
+    return None
+
+
+def _store_deprecated_scopes(kind: str, scopes: set[str]) -> None:
+    _deprecated_scope_cache[_scope_catalog_cache_key(kind)] = (time.monotonic(), scopes)
 
 
 def discovery_url() -> str:
@@ -158,17 +223,23 @@ def authorization_server_metadata_sync() -> dict:
 
 
 def _advertised_scopes(metadata: dict) -> list[str]:
-    """The scope set to advertise: the preferred scopes intersected with the
-    authorization server's live ``scopes_supported`` (so a renamed/removed scope
-    is never advertised). Falls back to mirroring the full discovery list when
-    none of the preferred scopes exist — e.g. a self-hosted project with a
-    custom, compact scope catalog."""
+    """The scope set to advertise. By default (no curated list) this mirrors the
+    authorization server's full live ``scopes_supported`` catalog — clients then
+    request everything and consent-time narrowing is the control point. When a
+    curated list is configured (``MCP_OAUTH_SCOPES``), it is intersected with
+    the discovered catalog so a renamed/removed scope is never advertised,
+    falling back to the full discovered list when the intersection is empty. A
+    later pass removes discovered scopes marked deprecated in Cloud's public
+    scope catalog."""
     discovered = metadata.get("scopes_supported")
     if not isinstance(discovered, list):
         raise ValueError(
             f"authorization server discovery missing scopes_supported: {discovery_url()}"
         )
-    scopes = [scope for scope in preferred_scopes() if scope in discovered]
+    preferred = preferred_scopes()
+    if not preferred:
+        return discovered
+    scopes = [scope for scope in preferred if scope in discovered]
     if scopes:
         return scopes
     _log(
@@ -178,21 +249,125 @@ def _advertised_scopes(metadata: dict) -> list[str]:
     return discovered
 
 
-def build_resource_metadata(scopes: list[str], authorization_servers=None) -> dict:
+async def _load_deprecated_scopes(client: httpx.AsyncClient, kind: str) -> set[str]:
+    cached = _cached_deprecated_scopes(kind)
+    if cached is not None:
+        return cached
+
+    resp = await client.get(f"{appwrite_endpoint()}/console/scopes/{kind}")
+    resp.raise_for_status()
+    scopes = resp.json().get("scopes")
+    if not isinstance(scopes, list):
+        raise ValueError("scope catalog response missing scopes list")
+
+    deprecated = {
+        scope["$id"]
+        for scope in scopes
+        if isinstance(scope, dict)
+        and isinstance(scope.get("$id"), str)
+        and scope.get("deprecated") is True
+    }
+    _store_deprecated_scopes(kind, deprecated)
+    return deprecated
+
+
+async def _filter_deprecated_scopes(scopes: list[str]) -> list[str]:
+    """Drop deprecated Console scopes while preserving the discovery contract.
+
+    OIDC discovery remains the supported-scope source of truth. The public
+    Console scope catalogs only add deprecation metadata, and failures are
+    fail-open so a catalog outage does not break OAuth discovery.
+    """
+    needs_project_catalog = any(
+        isinstance(scope, str)
+        and scope.startswith("project:")
+        and scope != "project:all"
+        for scope in scopes
+    )
+    needs_organization_catalog = any(
+        isinstance(scope, str)
+        and scope.startswith("organization:")
+        and scope != "organization:all"
+        for scope in scopes
+    )
+    if not needs_project_catalog and not needs_organization_catalog:
+        return scopes
+
+    project_cached = (
+        _cached_deprecated_scopes("project") if needs_project_catalog else set()
+    )
+    organization_cached = (
+        _cached_deprecated_scopes("organization")
+        if needs_organization_catalog
+        else set()
+    )
+
+    try:
+        if project_cached is not None and organization_cached is not None:
+            deprecated_project_scopes = project_cached
+            deprecated_organization_scopes = organization_cached
+        else:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                deprecated_project_scopes = (
+                    project_cached
+                    if project_cached is not None
+                    else await _load_deprecated_scopes(client, "project")
+                )
+                deprecated_organization_scopes = (
+                    organization_cached
+                    if organization_cached is not None
+                    else await _load_deprecated_scopes(client, "organization")
+                )
+    except Exception as exc:
+        _log(f"Scope catalog refresh failed ({exc}); advertising discovered scopes.")
+        return scopes
+
+    filtered = []
+    for scope in scopes:
+        if not isinstance(scope, str):
+            filtered.append(scope)
+            continue
+        if scope.startswith("project:"):
+            if (
+                scope != "project:all"
+                and scope.removeprefix("project:") in deprecated_project_scopes
+            ):
+                continue
+        elif scope.startswith("organization:"):
+            if (
+                scope != "organization:all"
+                and scope.removeprefix("organization:")
+                in deprecated_organization_scopes
+            ):
+                continue
+        filtered.append(scope)
+    return filtered
+
+
+def build_resource_metadata(
+    scopes: list[str], authorization_servers=None, *, resource: str | None = None
+) -> dict:
     """RFC 9728 Protected Resource Metadata document."""
     return {
-        "resource": canonical_resource(),
+        "resource": resource or canonical_resource(),
         "authorization_servers": authorization_servers or [issuer_url()],
         "scopes_supported": scopes,
         "bearer_methods_supported": ["header"],
     }
 
 
-async def protected_resource_metadata() -> dict:
+async def protected_resource_metadata(*, resource: str | None = None) -> dict:
     """RFC 9728 Protected Resource Metadata, with scopes validated against AS
     discovery."""
     metadata = await authorization_server_metadata()
-    return build_resource_metadata(_advertised_scopes(metadata), [metadata["issuer"]])
+    scopes = await _filter_deprecated_scopes(_advertised_scopes(metadata))
+    # With a console override active, the MCP server is the advertised
+    # authorization server: clients then discover the local authorize proxy from
+    # the metadata mirrored at this origin.
+    authorization_server = public_base_url() if console_url() else metadata["issuer"]
+    return build_resource_metadata(
+        scopes, [authorization_server], resource=resource or canonical_resource()
+    )
 
 
 def project_id_from_issuer(iss: str | None) -> str | None:
@@ -240,7 +415,6 @@ class AppwriteTokenVerifier(TokenVerifier):
         try:
             unverified = jwt.decode(token, options={"verify_signature": False})
         except jwt.PyJWTError:
-            telemetry.record_auth(outcome="rejected", reason="malformed")
             return None
 
         issuer = unverified.get("iss")
@@ -248,7 +422,6 @@ class AppwriteTokenVerifier(TokenVerifier):
             metadata = authorization_server_metadata_sync()
         except Exception as exc:
             _log(f"Rejecting token: authorization server discovery failed ({exc}).")
-            telemetry.record_auth(outcome="rejected", reason="discovery_failed")
             return None
 
         expected_issuer = metadata["issuer"]
@@ -257,20 +430,17 @@ class AppwriteTokenVerifier(TokenVerifier):
                 f"Rejecting token: issuer {issuer!r} does not match discovered "
                 f"issuer {expected_issuer!r}."
             )
-            telemetry.record_auth(outcome="rejected", reason="issuer_mismatch")
             return None
 
         project_id = project_id_from_issuer(issuer)
         if not project_id:
             _log("Rejecting token: issuer is not an Appwrite OAuth issuer.")
-            telemetry.record_auth(outcome="rejected", reason="issuer_mismatch")
             return None
         if project_id != configured_project_id():
             _log(
                 f"Rejecting token: issuer project {project_id!r} is not the served "
                 f"project {configured_project_id()!r}."
             )
-            telemetry.record_auth(outcome="rejected", reason="project_mismatch")
             return None
 
         try:
@@ -285,12 +455,10 @@ class AppwriteTokenVerifier(TokenVerifier):
             )
         except jwt.PyJWTError as exc:
             _log(f"Rejecting token: verification failed ({exc}).")
-            telemetry.record_auth(outcome="rejected", reason="signature")
             return None
 
-        expected_resource = canonical_resource()
-        if not self._audience_ok(claims.get("aud"), expected_resource):
-            telemetry.record_auth(outcome="rejected", reason="audience")
+        matched_resource = self._accepted_resource(claims.get("aud"))
+        if matched_resource is None:
             return None
 
         scope_claim = claims.get("scope") or claims.get("scp") or ""
@@ -305,38 +473,31 @@ class AppwriteTokenVerifier(TokenVerifier):
             ),
             scopes=scopes,
             expires_at=int(claims["exp"]) if "exp" in claims else None,
-            resource=expected_resource,
+            resource=matched_resource,
             subject=claims.get("sub"),
             claims={**claims, "project_id": project_id},
         )
 
-    def _audience_ok(self, aud, expected_resource: str) -> bool:
+    def _accepted_resource(self, aud) -> str | None:
         # Tokens must be audience-bound to this MCP server (RFC 8707). The Appwrite
         # OAuth server always issues Resource Indicators, so a missing or mismatched
         # audience is a hard rejection.
         audiences = (
             [aud] if isinstance(aud, str) else list(aud) if aud is not None else []
         )
-        if expected_resource in audiences:
-            return True
+        for resource in accepted_resources():
+            if resource in audiences:
+                return resource
         _log(
-            f"Rejecting token: audience {audiences!r} not bound to {expected_resource!r}."
+            f"Rejecting token: audience {audiences!r} not bound to any accepted "
+            f"resource {list(accepted_resources())!r}."
         )
-        return False
+        return None
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        start = time.monotonic()
         access_token = await to_thread.run_sync(self._verify_sync, token)
-        duration = time.monotonic() - start
         if access_token is None:
-            # The specific rejection reason was already counted in _verify_sync;
-            # here we only attach the duration to the rejected outcome.
-            telemetry.record_auth(outcome="rejected", duration_s=duration, count=False)
             return None
         if access_token.expires_at and access_token.expires_at < int(time.time()):
-            telemetry.record_auth(
-                outcome="rejected", reason="expired", duration_s=duration
-            )
             return None
-        telemetry.record_auth(outcome="success", duration_s=duration)
         return access_token

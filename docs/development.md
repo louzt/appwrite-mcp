@@ -24,7 +24,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ## Run the server
 
 **Docker Compose** — hosted HTTP/OAuth transport, endpoint at
-`http://localhost:8000/mcp` (default `MCP_PUBLIC_URL=http://localhost:8000`):
+`http://localhost:8000/` (default `MCP_PUBLIC_URL=http://localhost:8000`;
+`/mcp` is also supported):
 
 ```bash
 docker compose up --build
@@ -32,6 +33,9 @@ docker compose up --build
 
 > To enable docs search locally, set `OPENAI_API_KEY` in your shell or `.env`
 > before running Compose.
+
+> To enable hosted HTTP error monitoring locally, set `SENTRY_DSN`. You can also
+> set `SENTRY_ENVIRONMENT`; Compose defaults it to `development`.
 
 **`uv` directly — HTTP:**
 
@@ -68,7 +72,7 @@ Run the MCP Inspector against a server:
 npx @modelcontextprotocol/inspector
 ```
 
-To debug the hosted transport, point it at `https://mcp.appwrite.io/mcp` and
+To debug the hosted transport, point it at `https://mcp.appwrite.io/` and
 complete the OAuth flow when prompted. For self-hosted, start the Inspector in
 stdio mode with `uv run mcp-server-appwrite` as the command and the `APPWRITE_*`
 env vars above.

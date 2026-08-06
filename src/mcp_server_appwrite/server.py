@@ -21,25 +21,26 @@ from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from types import UnionType
-from typing import Any, Union, get_args, get_origin
+from typing import Any, Union, cast, get_args, get_origin
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 import mcp.server.stdio
 import mcp.types as types
+from anyio import to_thread
 from appwrite.client import Client
 from appwrite.enums.browser import Browser
 from appwrite.exception import AppwriteException
 from appwrite.input_file import InputFile
 from appwrite.service import Service as _SdkService
 from dotenv import find_dotenv, load_dotenv
-from mcp.server import NotificationOptions, Server
+from mcp import MCPError
+from mcp.server import NotificationOptions, Server, ServerRequestContext
 from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.models import InitializationOptions
-from pydantic import AnyUrl
+from mcp.types import CLIENT_INFO_META_KEY, INVALID_PARAMS
 
-from . import telemetry
+from . import error_monitoring, flags, telemetry
 from .constants import (
     CACHE_TTL_SECONDS,
     CATALOG_URI,
@@ -52,11 +53,17 @@ from .constants import (
     HOSTED_PATH_GUIDANCE,
     MAX_FETCH_BYTES,
     MAX_INLINE_BYTES,
+    SERVER_ICON_URL,
     SERVER_VERSION,
+    SERVER_WEBSITE_URL,
     TRANSPORTS,
     VALIDATION_SERVICE_ORDER,
 )
-from .context import _normalize_sample_limit, get_appwrite_context
+from .context import (
+    _normalize_sample_limit,
+    _normalize_service_detail,
+    get_appwrite_context,
+)
 from .docs_search import DocsSearch
 from .operator import Operator, _parse_tool_name
 from .service import Service
@@ -130,6 +137,7 @@ def parse_args(argv: list[str] | None = None):
         default=int(os.getenv("PORT", "8000")),
         help="Bind port for the HTTP server (default $PORT or 8000).",
     )
+    flags.register_cli_args(parser)
     args = parser.parse_args(argv)
     try:
         args.transport = _transport_arg(args.transport)
@@ -149,12 +157,26 @@ def load_environment() -> None:
         load_dotenv(dotenv_path=discovered_dotenv)
 
 
+def _normalize_endpoint(endpoint: str) -> str:
+    """Normalize Appwrite API base URLs used by the stdio transport.
+
+    Trailing slashes break some SDK path joins. A host with no ``/v1`` suffix is
+    a common self-hosted misconfig (Console URL pasted instead of the API base),
+    so append ``/v1`` when the URL has no path.
+    """
+    cleaned = endpoint.strip().rstrip("/")
+    split = urlsplit(cleaned)
+    if split.scheme and split.netloc and split.path in ("", "/"):
+        return f"{cleaned}/v1"
+    return cleaned
+
+
 def load_appwrite_config() -> AppwriteConfig:
     load_environment()
 
     project_id = os.getenv("APPWRITE_PROJECT_ID")
     api_key = os.getenv("APPWRITE_API_KEY")
-    endpoint = os.getenv("APPWRITE_ENDPOINT", DEFAULT_ENDPOINT)
+    endpoint = _normalize_endpoint(os.getenv("APPWRITE_ENDPOINT", DEFAULT_ENDPOINT))
 
     if not project_id or not api_key:
         raise ValueError(
@@ -164,14 +186,23 @@ def load_appwrite_config() -> AppwriteConfig:
     return AppwriteConfig(project_id=project_id, api_key=api_key, endpoint=endpoint)
 
 
+def _configure_mcp_client_headers(client: Client) -> Client:
+    current_user_agent = client._global_headers.get("user-agent", "")
+    suffix_start = current_user_agent.find(" ")
+    suffix = current_user_agent[suffix_start:] if suffix_start != -1 else ""
+
+    client.add_header("x-sdk-name", "mcp")
+    client.add_header("user-agent", f"AppwriteMCP/{SERVER_VERSION}{suffix}")
+    return client
+
+
 def build_client(config: AppwriteConfig | None = None) -> Client:
     config = config or load_appwrite_config()
     client = Client()
     client.set_endpoint(config.endpoint)
     client.set_project(config.project_id)
     client.set_key(config.api_key)
-    client.add_header("x-sdk-name", "mcp")
-    return client
+    return _configure_mcp_client_headers(client)
 
 
 def build_introspection_client() -> Client:
@@ -179,8 +210,7 @@ def build_introspection_client() -> Client:
     generation. It never makes API calls, so no project/key is required."""
     client = Client()
     client.set_endpoint(os.getenv("APPWRITE_ENDPOINT", DEFAULT_ENDPOINT))
-    client.add_header("x-sdk-name", "mcp")
-    return client
+    return _configure_mcp_client_headers(client)
 
 
 def build_client_for_request(
@@ -210,7 +240,7 @@ def build_client_for_request(
     client.set_endpoint(endpoint or os.getenv("APPWRITE_ENDPOINT", DEFAULT_ENDPOINT))
     client.set_project(target_project or project_id)
     client.add_header("Authorization", f"Bearer {bearer_token}")
-    client.add_header("x-sdk-name", "mcp")
+    client = _configure_mcp_client_headers(client)
     if target_project:
         client.add_header("x-appwrite-project", target_project)
         # Admin mode lets the console-issued token be recognized on another project
@@ -345,44 +375,59 @@ def _validate_service(service: Service) -> None:
 
 
 def validate_services(tools_manager: ToolManager) -> None:
+    """Probe Appwrite until one configured service succeeds.
+
+    Tries ``VALIDATION_SERVICE_ORDER`` in order so an API key that lacks
+    ``tables_db``/databases scopes can still pass via ``users``, ``teams``,
+    etc. Failing the first probe alone used to kill the stdio process before
+    the MCP handshake, which MCP clients surface as opaque reconnect errors
+    (for example Cursor ``-32000``).
+    """
     if not tools_manager.services:
         return
 
     services_by_name = {
         service.service_name: service for service in tools_manager.services
     }
-    service = next(
-        (
-            services_by_name[service_name]
-            for service_name in VALIDATION_SERVICE_ORDER
-            if service_name in services_by_name
-        ),
-        None,
-    )
-    if service is None:
+    probe_errors: list[str] = []
+
+    for service_name in VALIDATION_SERVICE_ORDER:
+        service = services_by_name.get(service_name)
+        if service is None:
+            continue
+
+        _log_startup(f"Validating startup access via {service.service_name}")
+        try:
+            _validate_service(service)
+        except AppwriteException as exc:
+            probe_errors.append(
+                f"- {service.service_name}: {_format_appwrite_error(exc)}"
+            )
+            _log_startup(
+                f"Startup probe via {service.service_name} failed; trying next service"
+            )
+            continue
+        except Exception as exc:
+            probe_errors.append(f"- {service.service_name}: {exc}")
+            _log_startup(
+                f"Startup probe via {service.service_name} failed; trying next service"
+            )
+            continue
+
+        _log_startup(f"Validated startup access via {service.service_name}")
         return
 
-    _log_startup(f"Validating startup access via {service.service_name}")
+    if not probe_errors:
+        return
 
-    try:
-        _validate_service(service)
-    except AppwriteException as exc:
-        telemetry.record_startup_validation(service.service_name, "error")
-        raise RuntimeError(
-            "Appwrite startup validation failed during the minimal startup probe. "
-            "Check your endpoint, project ID, API key, and required scopes.\n"
-            f"- {service.service_name}: {_format_appwrite_error(exc)}"
-        ) from exc
-    except Exception as exc:
-        telemetry.record_startup_validation(service.service_name, "error")
-        raise RuntimeError(
-            "Appwrite startup validation failed during the minimal startup probe. "
-            "Check your endpoint, project ID, API key, and required scopes.\n"
-            f"- {service.service_name}: {exc}"
-        ) from exc
-
-    telemetry.record_startup_validation(service.service_name, "success")
-    _log_startup(f"Validated startup access via {service.service_name}")
+    raise RuntimeError(
+        "Appwrite startup validation failed during the minimal startup probe. "
+        "Check your endpoint, project ID, API key, and required scopes. "
+        "The API key needs read access to at least one of: "
+        + ", ".join(VALIDATION_SERVICE_ORDER)
+        + ".\n"
+        + "\n".join(probe_errors)
+    )
 
 
 def _unwrap_optional_type(py_type: Any) -> Any:
@@ -432,20 +477,17 @@ def _validate_fetch_url(url: str) -> None:
     """
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):
-        telemetry.record_upload_error("scheme")
         raise ValueError(
             f"Unsupported URL scheme '{parts.scheme}' — only http and https are allowed."
         )
     host = parts.hostname
     if not host:
-        telemetry.record_upload_error("no_host")
         raise ValueError("URL is missing a host.")
 
     port = parts.port or (443 if parts.scheme == "https" else 80)
     try:
         infos = socket.getaddrinfo(host, port)
     except socket.gaierror as exc:
-        telemetry.record_upload_error("dns")
         raise ValueError(f"Could not resolve host '{host}'.") from exc
 
     for info in infos:
@@ -458,7 +500,6 @@ def _validate_fetch_url(url: str) -> None:
             or ip.is_multicast
             or ip.is_unspecified
         ):
-            telemetry.record_upload_error("ssrf")
             raise ValueError(
                 "Refusing to fetch a URL that resolves to a private, loopback, or "
                 "link-local address."
@@ -504,7 +545,6 @@ def _fetch_input_file(url: str, param_name: str) -> InputFile:
                 declared = resp.headers.get("content-length")
                 if declared is not None and declared.isdigit():
                     if int(declared) > MAX_FETCH_BYTES:
-                        telemetry.record_upload_error("too_large")
                         raise ValueError(
                             f"File at URL for '{param_name}' is too large "
                             f"({declared} bytes); max is {MAX_FETCH_BYTES} bytes."
@@ -515,7 +555,6 @@ def _fetch_input_file(url: str, param_name: str) -> InputFile:
                 for chunk in resp.iter_bytes():
                     total += len(chunk)
                     if total > MAX_FETCH_BYTES:
-                        telemetry.record_upload_error("too_large")
                         raise ValueError(
                             f"File at URL for '{param_name}' exceeds the max of "
                             f"{MAX_FETCH_BYTES} bytes."
@@ -528,13 +567,10 @@ def _fetch_input_file(url: str, param_name: str) -> InputFile:
                 )
                 filename = _derive_filename(resp, url)
     except httpx.HTTPError as exc:
-        reason = "timeout" if isinstance(exc, httpx.TimeoutException) else "http_error"
-        telemetry.record_upload_error(reason)
         raise ValueError(
             f"Failed to fetch file from URL for '{param_name}': {exc}"
         ) from exc
 
-    telemetry.record_upload(source="url", outcome="success", size_bytes=len(data))
     return InputFile.from_bytes(data, filename, mime_type or None)
 
 
@@ -542,38 +578,32 @@ def _coerce_inline_content(value: Mapping, param_name: str) -> InputFile:
     filename = value.get("filename")
     content = value.get("content")
     if content is None:
-        telemetry.record_upload_error("decode")
         raise ValueError(f"Missing inline 'content' for '{param_name}'.")
     encoding = str(value.get("encoding", "utf-8")).lower()
     if encoding == "base64":
         try:
             data = base64.b64decode(content)
         except Exception as exc:
-            telemetry.record_upload_error("decode")
             raise ValueError(f"Invalid base64 content for '{param_name}'.") from exc
     elif encoding == "utf-8":
         data = str(content).encode("utf-8")
     else:
-        telemetry.record_upload_error("encoding")
         raise ValueError(
             f"Invalid encoding for '{param_name}'. Expected 'utf-8' or 'base64'."
         )
 
     if len(data) > MAX_INLINE_BYTES:
-        telemetry.record_upload_error("too_large")
         raise ValueError(
             f"Inline content for '{param_name}' is too large "
             f"({len(data)} bytes, max {MAX_INLINE_BYTES}). For larger files pass "
             '{"url": "https://..."} so the server can download it directly.'
         )
 
-    telemetry.record_upload(source="inline", outcome="success", size_bytes=len(data))
     return InputFile.from_bytes(data, str(filename), value.get("mime_type"))
 
 
 def _coerce_path(path: str, param_name: str) -> InputFile:
     if _UPLOAD_TRANSPORT != "stdio":
-        telemetry.record_upload_error("path_unsupported")
         raise ValueError(HOSTED_PATH_GUIDANCE.format(param=param_name))
     return InputFile.from_path(path)
 
@@ -655,7 +685,7 @@ def _expected_argument_names(tool_info: dict) -> set[str]:
         return parameter_names
 
     definition = tool_info.get("definition")
-    input_schema = definition.inputSchema if definition is not None else None
+    input_schema = definition.input_schema if definition is not None else None
     properties = (
         input_schema.get("properties", {}) if isinstance(input_schema, dict) else {}
     )
@@ -788,38 +818,41 @@ def execute_registered_tool(
     bound_method = getattr(service_cls(client), method_name)
 
     parsed = _parse_tool_name(name)
-    start = time.monotonic()
     try:
         result = bound_method(**prepared_arguments)
     except AppwriteException as exc:
-        telemetry.record_appwrite_call(
+        error_monitoring.capture_appwrite_exception(
+            exc,
             service=parsed["service_name"],
             action=parsed["action_verb"],
             classification=parsed["classification"],
-            outcome="error",
-            duration_s=time.monotonic() - start,
-            error_code=getattr(exc, "code", None),
-            error_type=getattr(exc, "type", None),
+            project_id=target_project,
+            organization_id=organization_id,
         )
         raise RuntimeError(_format_appwrite_error(exc)) from exc
-    except Exception:
-        telemetry.record_appwrite_call(
-            service=parsed["service_name"],
-            action=parsed["action_verb"],
-            classification=parsed["classification"],
-            outcome="error",
-            duration_s=time.monotonic() - start,
-            error_type="internal",
+    except Exception as exc:
+        error_monitoring.capture_exception(
+            exc,
+            tags={
+                "appwrite.service": parsed["service_name"],
+                "appwrite.action": parsed["action_verb"],
+                "appwrite.classification": parsed["classification"],
+                "appwrite.project_id": target_project,
+                "appwrite.organization_id": organization_id,
+            },
+            context={
+                "appwrite": {
+                    "service": parsed["service_name"],
+                    "action": parsed["action_verb"],
+                    "classification": parsed["classification"],
+                    "project_id": target_project,
+                    "organization_id": organization_id,
+                },
+            },
+            transaction=(f"appwrite.{parsed['service_name']}.{parsed['action_verb']}"),
         )
         raise
 
-    telemetry.record_appwrite_call(
-        service=parsed["service_name"],
-        action=parsed["action_verb"],
-        classification=parsed["classification"],
-        outcome="success",
-        duration_s=time.monotonic() - start,
-    )
     return _format_tool_result(name, result, prepared_arguments)
 
 
@@ -883,15 +916,15 @@ def _format_binary_result(
     mime_type = _guess_mime_type(data, tool_name, arguments)
     encoded = base64.b64encode(data).decode("ascii")
     if mime_type.startswith("image/"):
-        return [types.ImageContent(type="image", data=encoded, mimeType=mime_type)]
+        return [types.ImageContent(type="image", data=encoded, mime_type=mime_type)]
 
     return [
         types.EmbeddedResource(
             type="resource",
             resource=types.BlobResourceContents(
-                uri=AnyUrl(f"appwrite://tool/{tool_name}"),
+                uri=f"appwrite://tool/{tool_name}",
                 blob=encoded,
-                mimeType=mime_type,
+                mime_type=mime_type,
             ),
         )
     ]
@@ -919,7 +952,10 @@ def _format_appwrite_error(exc: AppwriteException) -> str:
     if getattr(exc, "type", None):
         details.append(f"type={exc.type}")
     detail_text = f" ({', '.join(details)})" if details else ""
-    return f"Appwrite request failed{detail_text}: {exc}"
+    message = str(exc).replace("\n", " ").strip()
+    if len(message) > 500:
+        message = f"{message[:500]}..."
+    return f"Appwrite request failed{detail_text}: {message}"
 
 
 def build_instructions(transport: str = "http") -> str:
@@ -965,103 +1001,390 @@ def build_mcp_server(operator: Operator, *, transport: str = "http") -> Server:
     _configure_uploads(transport)
     instructions = build_instructions(transport)
 
-    server = Server("Appwrite MCP Server", instructions=instructions)
-
-    @server.list_tools()
-    async def handle_list_tools() -> list[types.Tool]:
-        _emit_initialize(server)
+    async def handle_list_tools(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListToolsResult:
+        _emit_initialize(ctx)
         start = time.monotonic()
         try:
-            result = operator.get_public_tools()
-        except Exception:
-            telemetry.record_request("tools/list", "error", time.monotonic() - start)
+            tools = operator.get_public_tools()
+        except Exception as exc:
+            telemetry.record_message(
+                "tools/list",
+                "error",
+                time.monotonic() - start,
+                error_code=_jsonrpc_error_code(exc),
+                error_message=type(exc).__name__,
+            )
+            mcp_context = _mcp_request_context(ctx)
+            error_monitoring.capture_exception(
+                exc,
+                tags={
+                    "mcp.method": "tools/list",
+                    "transport": transport,
+                    **mcp_context.tags,
+                },
+                context={
+                    "mcp": {
+                        "method": "tools/list",
+                        "transport": transport,
+                        **mcp_context.context,
+                    }
+                },
+                transaction="mcp.tools/list",
+            )
             raise
-        telemetry.record_request("tools/list", "success", time.monotonic() - start)
-        return result
+        telemetry.record_message("tools/list", "success", time.monotonic() - start)
+        return types.ListToolsResult(tools=tools)
 
-    @server.call_tool()
     async def handle_call_tool(
-        name: str, arguments: dict | None
-    ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
-        _emit_initialize(server)
+        ctx: ServerRequestContext, params: types.CallToolRequestParams
+    ) -> types.CallToolResult:
+        _emit_initialize(ctx)
         start = time.monotonic()
+        name = params.name
+        arguments = params.arguments or {}
         try:
             if not operator.has_public_tool(name):
+                telemetry.record_hallucination(name)
                 raise ValueError(f"Tool {name} not found")
-            result = operator.execute_public_tool(name, arguments)
-        except Exception:
-            telemetry.record_request("tools/call", "error", time.monotonic() - start)
-            raise
-        telemetry.record_request("tools/call", "success", time.monotonic() - start)
-        return result
+            content = await _execute_public_tool_for_transport(
+                operator, name, arguments, transport
+            )
+        except Exception as exc:
+            telemetry.record_message(
+                "tools/call",
+                "error",
+                time.monotonic() - start,
+                error_code=_jsonrpc_error_code(exc),
+                error_message=type(exc).__name__,
+            )
+            mcp_context = _mcp_request_context(ctx)
+            error_monitoring.capture_exception(
+                exc,
+                tags={
+                    "mcp.method": "tools/call",
+                    "tool.name": name,
+                    "transport": transport,
+                    **mcp_context.tags,
+                    **_target_context_tags(arguments),
+                },
+                context={
+                    "mcp": {
+                        "method": "tools/call",
+                        "tool_name": name,
+                        "transport": transport,
+                        **mcp_context.context,
+                    },
+                    "appwrite": _target_context(arguments),
+                },
+                transaction=f"mcp.tools/call:{name}",
+            )
+            # v2 no longer wraps handler exceptions into is_error=True tool
+            # results. Return one explicitly so the model still sees refusals
+            # (confirm_write) and Appwrite API errors.
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(exc))],
+                is_error=True,
+            )
+        telemetry.record_message("tools/call", "success", time.monotonic() - start)
+        return types.CallToolResult(content=cast(list[types.ContentBlock], content))
 
-    @server.list_resources()
-    async def handle_list_resources() -> list[types.Resource]:
+    async def handle_list_resources(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListResourcesResult:
+        _emit_initialize(ctx)
         start = time.monotonic()
         try:
-            result = operator.list_resources()
-        except Exception:
-            telemetry.record_request(
-                "resources/list", "error", time.monotonic() - start
+            resources = operator.list_resources()
+        except Exception as exc:
+            telemetry.record_message(
+                "resources/list",
+                "error",
+                time.monotonic() - start,
+                error_code=_jsonrpc_error_code(exc),
+                error_message=type(exc).__name__,
+            )
+            mcp_context = _mcp_request_context(ctx)
+            error_monitoring.capture_exception(
+                exc,
+                tags={
+                    "mcp.method": "resources/list",
+                    "transport": transport,
+                    **mcp_context.tags,
+                },
+                context={
+                    "mcp": {
+                        "method": "resources/list",
+                        "transport": transport,
+                        **mcp_context.context,
+                    }
+                },
+                transaction="mcp.resources/list",
             )
             raise
-        telemetry.record_request("resources/list", "success", time.monotonic() - start)
-        return result
+        telemetry.record_message("resources/list", "success", time.monotonic() - start)
+        return types.ListResourcesResult(resources=resources)
 
-    @server.list_resource_templates()
-    async def handle_list_resource_templates() -> list[types.ResourceTemplate]:
-        return operator.list_resource_templates()
+    async def handle_list_resource_templates(
+        ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+    ) -> types.ListResourceTemplatesResult:
+        return types.ListResourceTemplatesResult(
+            resource_templates=operator.list_resource_templates()
+        )
 
-    @server.read_resource()
-    async def handle_read_resource(uri) -> list[ReadResourceContents]:
+    async def handle_read_resource(
+        ctx: ServerRequestContext, params: types.ReadResourceRequestParams
+    ) -> types.ReadResourceResult:
+        _emit_initialize(ctx)
         start = time.monotonic()
-        uri_str = str(uri)
+        uri_str = str(params.uri)
         resource_type = "catalog" if uri_str == CATALOG_URI else "result"
-        telemetry.record_resource_read(resource_type)
         try:
-            result = operator.read_resource(uri_str)
-        except Exception:
-            telemetry.record_request(
-                "resources/read", "error", time.monotonic() - start
+            contents = operator.read_resource(uri_str)
+        except ValueError as exc:
+            telemetry.record_message(
+                "resources/read",
+                "error",
+                time.monotonic() - start,
+                error_code=_jsonrpc_error_code(exc),
+                error_message=type(exc).__name__,
+            )
+            mcp_context = _mcp_request_context(ctx)
+            error_monitoring.capture_exception(
+                exc,
+                tags={
+                    "mcp.method": "resources/read",
+                    "resource.type": resource_type,
+                    "transport": transport,
+                    **mcp_context.tags,
+                },
+                context={
+                    "mcp": {
+                        "method": "resources/read",
+                        "resource_type": resource_type,
+                        "transport": transport,
+                        **mcp_context.context,
+                    },
+                },
+                transaction=f"mcp.resources/read:{resource_type}",
+            )
+            raise MCPError(INVALID_PARAMS, str(exc)) from exc
+        except Exception as exc:
+            telemetry.record_message(
+                "resources/read",
+                "error",
+                time.monotonic() - start,
+                error_code=_jsonrpc_error_code(exc),
+                error_message=type(exc).__name__,
+            )
+            mcp_context = _mcp_request_context(ctx)
+            error_monitoring.capture_exception(
+                exc,
+                tags={
+                    "mcp.method": "resources/read",
+                    "resource.type": resource_type,
+                    "transport": transport,
+                    **mcp_context.tags,
+                },
+                context={
+                    "mcp": {
+                        "method": "resources/read",
+                        "resource_type": resource_type,
+                        "transport": transport,
+                        **mcp_context.context,
+                    },
+                },
+                transaction=f"mcp.resources/read:{resource_type}",
             )
             raise
-        telemetry.record_request("resources/read", "success", time.monotonic() - start)
-        return result
+        size_bytes = sum(
+            (
+                len(item.content)
+                if isinstance(item.content, bytes)
+                else len(str(item.content).encode("utf-8"))
+            )
+            for item in contents
+        )
+        telemetry.record_message_size("sent", size_bytes)
+        telemetry.record_message("resources/read", "success", time.monotonic() - start)
+        return types.ReadResourceResult(
+            contents=[
+                types.TextResourceContents(
+                    uri=uri_str,
+                    text=(
+                        item.content.decode("utf-8")
+                        if isinstance(item.content, bytes)
+                        else str(item.content)
+                    ),
+                    mime_type=item.mime_type,
+                )
+                for item in contents
+            ]
+        )
 
-    return server
+    return Server(
+        "Appwrite MCP Server",
+        version=SERVER_VERSION,
+        instructions=instructions,
+        website_url=SERVER_WEBSITE_URL,
+        icons=[types.Icon(src=SERVER_ICON_URL, mime_type="image/svg+xml")],
+        on_list_tools=handle_list_tools,
+        on_call_tool=handle_call_tool,
+        on_list_resources=handle_list_resources,
+        on_list_resource_templates=handle_list_resource_templates,
+        on_read_resource=handle_read_resource,
+    )
 
 
-def _emit_initialize(server: Server) -> None:
-    """Emit an ``mcp.initializations`` event and refresh active-user/client tracking
-    for the current session. Deduped per session in the telemetry layer. Best-effort:
-    any failure to read the request context is swallowed."""
+def _jsonrpc_error_code(exc: Exception) -> int:
+    return -32602 if isinstance(exc, ValueError) else -32603
+
+
+@dataclass(frozen=True)
+class McpRequestContext:
+    tags: dict[str, Any]
+    context: dict[str, Any]
+
+
+def _client_identity_from_ctx(
+    ctx: ServerRequestContext,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve client name/version/protocol from a request context.
+
+    Prefers the 2025-era handshake ``client_params`` when present; falls back to
+    the 2026-era ``_meta`` clientInfo key. ``protocol_version`` always comes from
+    ``ctx.protocol_version``, which both eras populate.
+    """
+    client_name: str | None = None
+    client_version: str | None = None
+    protocol_version: str | None = getattr(ctx, "protocol_version", None) or None
+
     try:
-        session = server.request_context.session
-        params = session.client_params
+        params = ctx.session.client_params
+    except Exception:
+        params = None
+
+    if params is not None:
+        client_info = getattr(params, "client_info", None)
+        client_name = getattr(client_info, "name", None)
+        client_version = getattr(client_info, "version", None)
+        if not protocol_version:
+            protocol_version = getattr(params, "protocol_version", None)
+
+    if client_name is None and isinstance(ctx.meta, dict):
+        meta_info = ctx.meta.get(CLIENT_INFO_META_KEY)
+        if isinstance(meta_info, dict):
+            name = meta_info.get("name")
+            version = meta_info.get("version")
+            client_name = name if isinstance(name, str) else None
+            client_version = version if isinstance(version, str) else None
+
+    return client_name, client_version, protocol_version
+
+
+def _mcp_request_context(ctx: ServerRequestContext) -> McpRequestContext:
+    try:
+        client_name, client_version, protocol_version = _client_identity_from_ctx(ctx)
+    except Exception:
+        return McpRequestContext(tags={}, context={})
+
+    tags = {
+        key: value
+        for key, value in {
+            "mcp.client.name": client_name,
+            "mcp.client.version": client_version,
+            "mcp.protocol_version": protocol_version,
+        }.items()
+        if value is not None
+    }
+    context = {
+        "client": {
+            key: value
+            for key, value in {
+                "name": client_name,
+                "version": client_version,
+                "protocol_version": protocol_version,
+            }.items()
+            if value is not None
+        }
+    }
+    if not context["client"]:
+        context = {}
+    return McpRequestContext(tags=tags, context=context)
+
+
+def _target_context(arguments: dict | None) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        return {}
+
+    project_id = arguments.get("project_id", arguments.get("projectId"))
+    organization_id = arguments.get("organization_id", arguments.get("organizationId"))
+    return {
+        key: value
+        for key, value in {
+            "project_id": project_id,
+            "organization_id": organization_id,
+        }.items()
+        if value is not None
+    }
+
+
+def _target_context_tags(arguments: dict | None) -> dict[str, Any]:
+    context = _target_context(arguments)
+    return {
+        key: context[source]
+        for key, source in {
+            "appwrite.project_id": "project_id",
+            "appwrite.organization_id": "organization_id",
+        }.items()
+        if source in context
+    }
+
+
+async def _execute_public_tool_for_transport(
+    operator: Operator,
+    name: str,
+    arguments: dict | None,
+    transport: str,
+) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+    if transport != "http":
+        return operator.execute_public_tool(name, arguments)
+
+    # The Appwrite Python SDK, docs embedding client, context discovery, and URL
+    # upload fetches are synchronous. Running them on the ASGI event-loop thread
+    # can make even /healthz stop responding while a tool call is slow or stuck.
+    return await to_thread.run_sync(
+        operator.execute_public_tool, name, arguments, abandon_on_cancel=True
+    )
+
+
+def _emit_initialize(ctx: ServerRequestContext) -> None:
+    """Refine the request identity from negotiated client params / ``_meta``.
+
+    On the hosted stateless transport, 2025-era ``client_params`` are usually
+    absent — each POST is its own session, and connections/handshakes are counted
+    by ``MCPIdentityMiddleware`` in the HTTP layer instead. 2026-era clients carry
+    identity in ``_meta`` instead. Best-effort: any failure is swallowed.
+    """
+    try:
+        client_name, _client_version, protocol_version = _client_identity_from_ctx(ctx)
     except Exception:
         return
-    if params is None:
-        return
 
-    client_info = getattr(params, "clientInfo", None)
-    oauth_client_id = None
     subject = None
     try:
         access_token = get_access_token()
         if access_token is not None:
             claims = access_token.claims or {}
-            oauth_client_id = claims.get("client_id") or claims.get("azp")
             subject = access_token.subject or claims.get("sub")
     except Exception:
         pass
 
-    telemetry.record_initialize(
-        session_id=id(session),
-        client_name=getattr(client_info, "name", None),
-        client_version=getattr(client_info, "version", None),
-        protocol_version=getattr(params, "protocolVersion", None),
-        oauth_client_id=oauth_client_id,
+    telemetry.set_request_identity(
+        client_name=client_name,
         subject=subject,
+        protocol_version=protocol_version,
     )
 
 
@@ -1113,6 +1436,9 @@ def _get_context_for_request(
     sample_limit = _normalize_sample_limit(
         arguments.get("sample_limit", arguments.get("sampleLimit", 5))
     )
+    service_detail = _normalize_service_detail(
+        arguments.get("service_detail", arguments.get("serviceDetail", "totals"))
+    )
 
     if client is not None:
         return get_appwrite_context(
@@ -1121,6 +1447,7 @@ def _get_context_for_request(
             project_id=project_id,
             include_services=include_services,
             sample_limit=sample_limit,
+            service_detail=service_detail,
         )
 
     base_client = resolve_client()
@@ -1138,6 +1465,7 @@ def _get_context_for_request(
         organization_id=organization_id,
         include_services=include_services,
         sample_limit=sample_limit,
+        service_detail=service_detail,
     )
 
 
@@ -1178,14 +1506,25 @@ async def run_stdio() -> None:
         )
 
 
-def main():
+def main() -> int:
     """Entry point: stdio by default, or Streamable HTTP when requested."""
     load_environment()
     args = parse_args()
 
     if args.transport == "stdio":
-        asyncio.run(run_stdio())
+        try:
+            asyncio.run(run_stdio())
+        except (ValueError, RuntimeError) as exc:
+            # Config/validation failures must stay on stderr as a short message.
+            # An uncaught traceback still exits non-zero, but MCP clients only
+            # report a generic reconnect error (e.g. Cursor -32000).
+            print(f"[appwrite-mcp] ERROR: {exc}", file=sys.stderr, flush=True)
+            return 1
         return 0
+
+    # Testing flags are read from the environment at request time; fold any
+    # CLI-provided values back in (see flags.py and docs/flags.md).
+    flags.apply_cli_args(args)
 
     from .http_app import run_http
 
@@ -1194,4 +1533,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

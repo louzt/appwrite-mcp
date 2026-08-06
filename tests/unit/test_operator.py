@@ -1,8 +1,9 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import mcp.types as types
 
-from mcp_server_appwrite.operator import CATALOG_URI, Operator
+from mcp_server_appwrite.operator import CATALOG_URI, Operator, ResultStore
 from mcp_server_appwrite.tool_manager import ToolManager
 
 
@@ -12,7 +13,7 @@ def make_tool(
     return types.Tool(
         name=name,
         description=description,
-        inputSchema={
+        input_schema={
             "type": "object",
             "properties": {
                 "parameter": {"type": "string"},
@@ -32,7 +33,7 @@ class FakeDocsSearch:
         return types.Tool(
             name="appwrite_search_docs",
             description="Search the Appwrite documentation.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
                 "required": ["query"],
@@ -314,7 +315,7 @@ class OperatorTests(unittest.TestCase):
         runtime = Operator(
             manager,
             lambda name, arguments, *_: [
-                types.ImageContent(type="image", data="aW1hZ2U=", mimeType="image/png")
+                types.ImageContent(type="image", data="aW1hZ2U=", mime_type="image/png")
             ],
             store_results=False,
         )
@@ -326,7 +327,33 @@ class OperatorTests(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertIsInstance(result[0], types.ImageContent)
-        self.assertEqual(result[0].mimeType, "image/png")
+        self.assertEqual(result[0].mime_type, "image/png")
+
+
+class ResultStoreTests(unittest.TestCase):
+    def test_concurrent_save_and_list_are_thread_safe(self):
+        store = ResultStore(max_size=50)
+        content = [types.TextContent(type="text", text="ok")]
+
+        def save_many():
+            for index in range(500):
+                store.save("tables_db_list", content, f"result {index}")
+
+        def list_many():
+            for _ in range(500):
+                store.list()
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(save_many),
+                executor.submit(save_many),
+                executor.submit(list_many),
+                executor.submit(list_many),
+            ]
+            for future in futures:
+                future.result()
+
+        self.assertLessEqual(len(store.list()), 50)
 
 
 if __name__ == "__main__":

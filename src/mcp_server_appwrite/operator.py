@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -11,9 +12,9 @@ from uuid import uuid4
 
 import mcp.types as types
 from mcp.server.lowlevel.helper_types import ReadResourceContents
-from pydantic import AnyUrl
 
 from . import telemetry
+from .annotations import annotations_for_classification, annotations_for_gateway
 from .constants import (
     CATALOG_URI,
     CREATE_HINTS,
@@ -74,12 +75,15 @@ class ResultStore:
     def __init__(self, max_size: int = RESULT_STORE_SIZE):
         self._entries: OrderedDict[str, StoredResult] = OrderedDict()
         self._max_size = max_size
+        self._lock = threading.Lock()
 
     def get(self, result_id: str) -> StoredResult | None:
-        return self._entries.get(result_id)
+        with self._lock:
+            return self._entries.get(result_id)
 
     def list(self) -> list[StoredResult]:
-        return list(self._entries.values())
+        with self._lock:
+            return list(self._entries.values())
 
     def save(
         self, tool_name: str, content: list[ToolContent], text: str
@@ -91,9 +95,10 @@ class ResultStore:
             text=text,
             tool_name=tool_name,
         )
-        self._entries[result.result_id] = result
-        while len(self._entries) > self._max_size:
-            self._entries.popitem(last=False)
+        with self._lock:
+            self._entries[result.result_id] = result
+            while len(self._entries) > self._max_size:
+                self._entries.popitem(last=False)
         return result
 
 
@@ -125,6 +130,20 @@ class Operator:
         return CATALOG_URI
 
     def get_public_tools(self) -> list[types.Tool]:
+        # Centralised annotations: each tool maps to a classification bucket
+        # (read / unknown), and `annotations_for_classification` is the single
+        # source of truth for the resulting MCP ToolAnnotations.
+        read_annotations = annotations_for_classification("read")
+        # `appwrite_call_tool` is a *gateway* — it dispatches to Appwrite SDK
+        # methods whose read/write/delete nature is determined at runtime from
+        # caller-supplied input. We cannot honestly advertise a static safety
+        # profile here; `annotations_for_gateway()` leaves `destructiveHint`
+        # unset so MCP clients default to destructive (their spec default) and
+        # prompt the human user — matching the runtime `confirm_write=true`
+        # gate inside `_call_hidden_tool`. See annotations.py for the full
+        # rationale and the Greptile review that motivated the split.
+        gateway_annotations = annotations_for_gateway()
+
         tools = [
             types.Tool(
                 name="appwrite_get_context",
@@ -134,7 +153,7 @@ class Operator:
                     "connection can read them. Use this before searching the hidden catalog "
                     "when orienting to a user's Appwrite workspace."
                 ),
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "project_id": {
@@ -147,17 +166,27 @@ class Operator:
                         },
                         "include_services": {
                             "type": "boolean",
-                            "description": "Include per-project service totals and small item samples. Defaults to true.",
+                            "description": (
+                                "Include per-project service summaries. Defaults to true, "
+                                "but large project sets are skipped unless project_id is provided."
+                            ),
+                        },
+                        "service_detail": {
+                            "type": "string",
+                            "enum": ["totals", "samples"],
+                            "description": "Service summary detail. Defaults to totals; samples includes small item previews.",
                         },
                         "sample_limit": {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 25,
-                            "description": "Maximum sample items per service. Defaults to 5.",
+                            "description": "Maximum sample items per service when service_detail=samples. Defaults to 5.",
                         },
                     },
                     "additionalProperties": False,
                 },
+                # Read-only: queries account/org/project metadata; no writes.
+                annotations=read_annotations,
             ),
             types.Tool(
                 name="appwrite_search_tools",
@@ -165,7 +194,7 @@ class Operator:
                     "Search the hidden Appwrite tool catalog by natural language query. "
                     "Use this before appwrite_call_tool when using the Appwrite operator surface."
                 ),
-                inputSchema={
+                input_schema={
                     "type": "object",
                     "properties": {
                         "query": {
@@ -197,6 +226,8 @@ class Operator:
                     "required": ["query"],
                     "additionalProperties": False,
                 },
+                # Read-only: searches the in-memory catalog; no side effects.
+                annotations=read_annotations,
             ),
             types.Tool(
                 name="appwrite_call_tool",
@@ -205,7 +236,7 @@ class Operator:
                     "Mutating tools require confirm_write=true. Hidden Appwrite parameters accept "
                     "canonical snake_case names and common camelCase aliases."
                 ),
-                inputSchema={
+input_schema={
                     "type": "object",
                     "properties": {
                         "tool_name": {
@@ -243,6 +274,14 @@ class Operator:
                     "required": ["tool_name"],
                     "additionalProperties": True,
                 },
+                # Gateway: dispatches to Appwrite SDK methods which may include
+                # writes or deletes. `destructiveHint` is intentionally **unset**
+                # (None) — the MCP 2025-06-18 spec treats unset as `true`, so
+                # clients that gate approval on the hint will prompt the human
+                # user for every gateway call. The runtime `confirm_write=true`
+                # check in `_call_hidden_tool` provides the secondary boundary
+                # inside the server.
+                annotations=gateway_annotations,
             ),
         ]
 
@@ -261,14 +300,27 @@ class Operator:
         self, name: str, arguments: dict[str, Any] | None
     ) -> list[ToolContent]:
         start = time.monotonic()
-        outcome = "success"
+        status = "success"
+        error_type: str | None = None
+        output_chars = 0
+        telemetry.tool_call_started(name)
         try:
-            return self._dispatch_public_tool(name, arguments)
-        except Exception:
-            outcome = "error"
+            result = self._dispatch_public_tool(name, arguments)
+            output_chars = _content_size(result)
+            return result
+        except Exception as exc:
+            status = "error"
+            error_type = type(exc).__name__
             raise
         finally:
-            telemetry.record_tool_call(name, outcome, time.monotonic() - start)
+            telemetry.record_tool_call(
+                name,
+                status,
+                time.monotonic() - start,
+                error_type=error_type,
+                input_chars=len(json.dumps(arguments)) if arguments else 0,
+                output_chars=output_chars,
+            )
 
     def _dispatch_public_tool(
         self, name: str, arguments: dict[str, Any] | None
@@ -288,24 +340,15 @@ class Operator:
         if self._context_provider is None:
             raise RuntimeError("Appwrite context provider is not configured.")
         context = self._context_provider(arguments)
-        mode = "unknown"
-        if isinstance(context, dict):
-            connection = context.get("connection")
-            if isinstance(connection, dict):
-                mode = str(connection.get("mode", "unknown"))
-        include_services = bool(
-            arguments.get("include_services", arguments.get("includeServices", True))
-        )
-        telemetry.record_context_request(mode=mode, include_services=include_services)
         return [types.TextContent(type="text", text=json.dumps(context, indent=2))]
 
     def list_resources(self) -> list[types.Resource]:
         resources = [
             types.Resource(
-                uri=AnyUrl(CATALOG_URI),
+                uri=CATALOG_URI,
                 name="Appwrite Hidden Tool Catalog",
                 description="Full internal Appwrite tool catalog used by the Appwrite operator surface.",
-                mimeType="application/json",
+                mime_type="application/json",
                 size=len(self._cached_catalog_json.encode("utf-8")),
             )
         ]
@@ -313,10 +356,10 @@ class Operator:
         for stored_result in self._result_store.list():
             resources.append(
                 types.Resource(
-                    uri=AnyUrl(stored_result.uri),
+                    uri=stored_result.uri,
                     name=f"{stored_result.tool_name} result",
                     description="Stored Appwrite tool result. Read this resource to inspect the full output.",
-                    mimeType="application/json",
+                    mime_type="application/json",
                     size=len(stored_result.text.encode("utf-8")),
                 )
             )
@@ -326,10 +369,10 @@ class Operator:
     def list_resource_templates(self) -> list[types.ResourceTemplate]:
         return [
             types.ResourceTemplate(
-                uriTemplate=RESULT_URI_TEMPLATE,
+                uri_template=RESULT_URI_TEMPLATE,
                 name="Stored Appwrite Tool Result",
                 description="Stored result payloads created by appwrite_call_tool.",
-                mimeType="application/json",
+                mime_type="application/json",
             )
         ]
 
@@ -356,7 +399,7 @@ class Operator:
         entries: list[CatalogEntry] = []
         for tool in self._tools_manager.get_all_tools():
             parsed = _parse_tool_name(tool.name)
-            input_schema = tool.inputSchema or {}
+            input_schema = tool.input_schema or {}
             entries.append(
                 CatalogEntry(
                     action_verb=parsed["action_verb"],
@@ -409,9 +452,6 @@ class Operator:
             include_mutating=include_mutating,
             limit=_normalize_limit(arguments.get("limit"), self._search_limit),
         )
-        telemetry.record_search_tools(
-            include_mutating=include_mutating, match_count=len(matches)
-        )
 
         lines: list[str] = []
         if not matches:
@@ -450,6 +490,7 @@ class Operator:
 
         entry = self._catalog_map.get(tool_name)
         if not entry:
+            telemetry.record_hallucination(tool_name)
             raise ValueError(
                 f"Tool {tool_name} was not found. Use appwrite_search_tools first."
             )
@@ -457,13 +498,10 @@ class Operator:
         confirm_write = bool(
             raw_arguments.get("confirm_write", raw_arguments.get("confirmWrite", False))
         )
-        if entry.classification != "read":
-            if not confirm_write:
-                telemetry.record_write_confirmation(entry.classification, "blocked")
-                raise RuntimeError(
-                    f"Tool {tool_name} is {entry.classification}. Re-run appwrite_call_tool with confirm_write=true if you intend to mutate Appwrite state."
-                )
-            telemetry.record_write_confirmation(entry.classification, "confirmed")
+        if entry.classification != "read" and not confirm_write:
+            raise RuntimeError(
+                f"Tool {tool_name} is {entry.classification}. Re-run appwrite_call_tool with confirm_write=true if you intend to mutate Appwrite state."
+            )
 
         project_id = raw_arguments.get("project_id", raw_arguments.get("projectId"))
         organization_id = raw_arguments.get(
@@ -491,7 +529,6 @@ class Operator:
             stored_result = self._result_store.save(
                 tool_name, content, _serialize_content(content)
             )
-            telemetry.record_result_stored(tool_name)
             preview = full_text[: self._preview_threshold]
             return [
                 types.TextContent(
@@ -506,7 +543,6 @@ class Operator:
         stored_result = self._result_store.save(
             tool_name, content, _serialize_content(content)
         )
-        telemetry.record_result_stored(tool_name)
         summary = ", ".join(_summarize_content_item(item) for item in content)
         return [
             types.TextContent(
@@ -762,9 +798,23 @@ def _normalize_arguments(raw_arguments: dict[str, Any]) -> dict[str, Any]:
     return merged_arguments
 
 
+def _content_size(content: list[ToolContent]) -> int:
+    total = 0
+    for item in content:
+        if isinstance(item, types.TextContent):
+            total += len(item.text)
+        elif isinstance(item, types.ImageContent):
+            total += len(item.data)
+        else:
+            text = getattr(item.resource, "text", None)
+            blob = getattr(item.resource, "blob", None)
+            total += len(text or blob or "")
+    return total
+
+
 def _serialize_content(content: list[ToolContent]) -> str:
     return json.dumps(
-        [item.model_dump(mode="json") for item in content],
+        [item.model_dump(mode="json", by_alias=True) for item in content],
         indent=2,
         ensure_ascii=False,
     )
@@ -775,8 +825,8 @@ def _summarize_content_item(item: ToolContent) -> str:
         preview = item.text.strip().splitlines()[0] if item.text.strip() else "text"
         return f"text:{preview[:60]}"
     if isinstance(item, types.ImageContent):
-        return f"image:{item.mimeType}"
-    return f"resource:{item.resource.mimeType or 'application/octet-stream'}"
+        return f"image:{item.mime_type}"
+    return f"resource:{item.resource.mime_type or 'application/octet-stream'}"
 
 
 def _now_iso() -> str:

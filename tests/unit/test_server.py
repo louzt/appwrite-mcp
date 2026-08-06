@@ -1,26 +1,38 @@
+import asyncio
 import base64
 import io
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import mcp.types as types
 from appwrite.enums.browser import Browser
+from appwrite.exception import AppwriteException
 from appwrite.input_file import InputFile
 
 from mcp_server_appwrite import server as server_module
 from mcp_server_appwrite.server import (
     _coerce_argument,
     _configure_uploads,
+    _execute_public_tool_for_transport,
+    _format_appwrite_error,
     _format_tool_result,
+    _mcp_request_context,
+    _normalize_endpoint,
     _prepare_arguments,
     _validate_service,
     build_client,
+    build_client_for_request,
     build_instructions,
+    build_introspection_client,
+    build_mcp_server,
     build_operator,
+    execute_registered_tool,
+    load_appwrite_config,
     parse_args,
     register_services,
     resolve_region_endpoint,
@@ -77,6 +89,49 @@ class ServerHelperTests(unittest.TestCase):
         self.assertEqual(args.host, "0.0.0.0")
         self.assertEqual(args.port, 8000)
 
+    def test_normalize_endpoint_strips_slash_and_appends_v1(self):
+        self.assertEqual(
+            _normalize_endpoint("http://localhost:9501/"),
+            "http://localhost:9501/v1",
+        )
+        self.assertEqual(
+            _normalize_endpoint("https://appwrite.example.com"),
+            "https://appwrite.example.com/v1",
+        )
+        self.assertEqual(
+            _normalize_endpoint("https://appwrite.example.com/v1/"),
+            "https://appwrite.example.com/v1",
+        )
+
+    def test_load_appwrite_config_normalizes_endpoint(self):
+        with patch.dict(
+            os.environ,
+            {
+                "APPWRITE_PROJECT_ID": "proj",
+                "APPWRITE_API_KEY": "key",
+                "APPWRITE_ENDPOINT": "http://localhost:9501",
+            },
+            clear=True,
+        ):
+            config = load_appwrite_config()
+
+        self.assertEqual(config.endpoint, "http://localhost:9501/v1")
+
+    def test_main_stdio_prints_clean_error_on_validation_failure(self):
+        async def boom():
+            raise RuntimeError("bad credentials")
+
+        args = parse_args(["--transport", "stdio"])
+        with (
+            patch("mcp_server_appwrite.server.parse_args", return_value=args),
+            patch("mcp_server_appwrite.server.run_stdio", side_effect=boom),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            code = server_module.main()
+
+        self.assertEqual(code, 1)
+        self.assertIn("[appwrite-mcp] ERROR: bad credentials", stderr.getvalue())
+
     def test_parse_args_accepts_env_transport(self):
         with patch.dict(os.environ, {"MCP_TRANSPORT": "http", "PORT": "9000"}):
             args = parse_args([])
@@ -106,6 +161,48 @@ class ServerHelperTests(unittest.TestCase):
         self.assertIn("project_id", http)
         self.assertIn("Large results are stored as resources", stdio)
         self.assertIn("returns tool results inline", http)
+
+    def test_build_mcp_server_reports_appwrite_metadata(self):
+        server = build_mcp_server(Mock(), transport="stdio")
+        options = server.create_initialization_options()
+
+        self.assertEqual(server.version, server_module.SERVER_VERSION)
+        self.assertEqual(options.website_url, server_module.SERVER_WEBSITE_URL)
+        self.assertEqual(
+            [
+                icon.model_dump(by_alias=True, exclude_none=True)
+                for icon in options.icons
+            ],
+            [
+                {
+                    "src": server_module.SERVER_ICON_URL,
+                    "mimeType": "image/svg+xml",
+                }
+            ],
+        )
+
+    def test_http_tool_execution_does_not_block_event_loop(self):
+        class BlockingOperator:
+            def execute_public_tool(self, name, arguments):
+                time.sleep(0.2)
+                return [types.TextContent(type="text", text="ok")]
+
+        async def run_check():
+            start = time.monotonic()
+            task = asyncio.create_task(
+                _execute_public_tool_for_transport(
+                    BlockingOperator(), "appwrite_call_tool", {}, "http"
+                )
+            )
+
+            await asyncio.sleep(0.01)
+
+            self.assertLess(time.monotonic() - start, 0.1)
+            self.assertFalse(task.done())
+            result = await task
+            self.assertEqual(result[0].text, "ok")
+
+        asyncio.run(run_check())
 
     def test_coerce_input_file_from_path(self):
         with tempfile.NamedTemporaryFile(suffix=".txt") as handle:
@@ -151,6 +248,39 @@ class ServerHelperTests(unittest.TestCase):
         self.assertEqual(client._endpoint, "https://example.test/v1")
         self.assertEqual(client.get_config("project"), "test-project")
         self.assertEqual(client._global_headers["x-appwrite-key"], "test-key")
+        self.assert_mcp_client_headers(client)
+
+    def assert_mcp_client_headers(self, client):
+        user_agent = client._global_headers["user-agent"]
+
+        self.assertEqual(client._global_headers["x-sdk-name"], "mcp")
+        self.assertTrue(
+            user_agent.startswith(f"AppwriteMCP/{server_module.SERVER_VERSION}"),
+            user_agent,
+        )
+        self.assertNotIn("AppwritePythonSDK", user_agent)
+
+    def test_build_introspection_client_sets_mcp_headers(self):
+        client = build_introspection_client()
+
+        self.assert_mcp_client_headers(client)
+
+    def test_build_client_for_request_sets_mcp_headers_and_auth_context(self):
+        client = build_client_for_request(
+            "console",
+            "test-token",
+            endpoint="https://example.test/v1",
+            target_project="target-project",
+            organization_id="org-id",
+        )
+
+        self.assertEqual(client._endpoint, "https://example.test/v1")
+        self.assertEqual(client.get_config("project"), "target-project")
+        self.assertEqual(client._global_headers["authorization"], "Bearer test-token")
+        self.assertEqual(client._global_headers["x-appwrite-project"], "target-project")
+        self.assertEqual(client._global_headers["x-appwrite-mode"], "admin")
+        self.assertEqual(client._global_headers["x-appwrite-organization"], "org-id")
+        self.assert_mcp_client_headers(client)
 
     def test_coerce_enum_returns_raw_value_string(self):
         self.assertEqual(_coerce_argument("code", "ch", Browser), "ch")
@@ -284,7 +414,163 @@ class ServerHelperTests(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertIsInstance(result[0], types.EmbeddedResource)
-        self.assertEqual(result[0].resource.mimeType, "application/octet-stream")
+        self.assertEqual(result[0].resource.mime_type, "application/octet-stream")
+
+    def test_format_appwrite_error_truncates_large_html_body(self):
+        exc = AppwriteException("<!DOCTYPE html>" + ("x" * 1000), 404, None)
+
+        message = _format_appwrite_error(exc)
+
+        self.assertIn("code=404", message)
+        self.assertLess(len(message), 560)
+        self.assertTrue(message.endswith("..."))
+
+    def test_mcp_request_context_extracts_client_metadata(self):
+        ctx = Mock()
+        ctx.protocol_version = "2025-06-18"
+        ctx.meta = None
+        ctx.session.client_params = type(
+            "Params",
+            (),
+            {
+                "client_info": type(
+                    "ClientInfo",
+                    (),
+                    {"name": "codex", "version": "1.2.3"},
+                )(),
+                "protocol_version": "2025-06-18",
+            },
+        )()
+
+        context = _mcp_request_context(ctx)
+
+        self.assertEqual(
+            context.tags,
+            {
+                "mcp.client.name": "codex",
+                "mcp.client.version": "1.2.3",
+                "mcp.protocol_version": "2025-06-18",
+            },
+        )
+        self.assertEqual(
+            context.context,
+            {
+                "client": {
+                    "name": "codex",
+                    "version": "1.2.3",
+                    "protocol_version": "2025-06-18",
+                }
+            },
+        )
+
+    def test_mcp_request_context_falls_back_to_meta_client_info(self):
+        from mcp.types import CLIENT_INFO_META_KEY
+
+        ctx = Mock()
+        ctx.protocol_version = "2026-07-28"
+        ctx.session.client_params = None
+        ctx.meta = {
+            CLIENT_INFO_META_KEY: {"name": "cursor", "version": "2.0"},
+        }
+
+        context = _mcp_request_context(ctx)
+
+        self.assertEqual(
+            context.tags,
+            {
+                "mcp.client.name": "cursor",
+                "mcp.client.version": "2.0",
+                "mcp.protocol_version": "2026-07-28",
+            },
+        )
+
+    def test_mcp_request_context_tolerates_missing_client_metadata(self):
+        ctx = Mock()
+        ctx.protocol_version = None
+        ctx.meta = None
+        ctx.session.client_params = None
+
+        context = _mcp_request_context(ctx)
+
+        self.assertEqual(context.tags, {})
+        self.assertEqual(context.context, {})
+
+    def test_call_tool_handler_returns_is_error_for_confirm_write_refusal(self):
+        """v2 no longer wraps exceptions; the handler must return is_error=True."""
+
+        class RefusingOperator:
+            def has_public_tool(self, name):
+                return True
+
+            def execute_public_tool(self, name, arguments):
+                raise RuntimeError(
+                    "Tool tables_db_create is write. Re-run appwrite_call_tool "
+                    "with confirm_write=true if you intend to mutate Appwrite state."
+                )
+
+            def get_public_tools(self):
+                return []
+
+            def list_resources(self):
+                return []
+
+            def list_resource_templates(self):
+                return []
+
+            def read_resource(self, uri):
+                raise ValueError(f"Unknown resource URI: {uri}")
+
+        server = build_mcp_server(RefusingOperator(), transport="stdio")
+        entry = server.get_request_handler("tools/call")
+        self.assertIsNotNone(entry)
+
+        async def run_check():
+            ctx = Mock()
+            ctx.protocol_version = "2025-11-25"
+            ctx.meta = None
+            ctx.session.client_params = None
+            params = types.CallToolRequestParams(
+                name="appwrite_call_tool",
+                arguments={"tool_name": "tables_db_create"},
+            )
+            result = await entry.handler(ctx, params)
+            self.assertIsInstance(result, types.CallToolResult)
+            self.assertTrue(result.is_error)
+            self.assertIn("confirm_write=true", result.content[0].text)
+
+        asyncio.run(run_check())
+
+    def test_call_tool_handler_returns_is_error_for_unknown_tool(self):
+        class EmptyOperator:
+            def has_public_tool(self, name):
+                return False
+
+            def get_public_tools(self):
+                return []
+
+            def list_resources(self):
+                return []
+
+            def list_resource_templates(self):
+                return []
+
+        server = build_mcp_server(EmptyOperator(), transport="stdio")
+        entry = server.get_request_handler("tools/call")
+
+        async def run_check():
+            ctx = Mock()
+            ctx.protocol_version = "2025-11-25"
+            ctx.meta = None
+            ctx.session.client_params = None
+            params = types.CallToolRequestParams(
+                name="made_up_tool",
+                arguments={},
+            )
+            result = await entry.handler(ctx, params)
+            self.assertTrue(result.is_error)
+            self.assertIn("Tool made_up_tool not found", result.content[0].text)
+
+        asyncio.run(run_check())
 
     def test_register_services_returns_fresh_manager(self):
         manager_a = register_services(object())
@@ -318,7 +604,7 @@ class ServerHelperTests(unittest.TestCase):
             )()
         ]
 
-        with self.assertRaisesRegex(RuntimeError, "tables_db: boom"):
+        with self.assertRaisesRegex(RuntimeError, r"tables_db: boom"):
             validate_services(manager)
 
     def test_validate_services_accepts_successful_probe(self):
@@ -366,6 +652,58 @@ class ServerHelperTests(unittest.TestCase):
         ]
 
         validate_services(manager)
+
+    def test_validate_services_falls_through_to_next_service(self):
+        calls = []
+
+        class FailingService:
+            def list(self):
+                calls.append("tables_db")
+                raise Exception("missing databases scope")
+
+        class SuccessfulService:
+            def list(self):
+                calls.append("users")
+                return {"total": 0}
+
+        manager = ToolManager()
+        manager.services = [
+            type(
+                "StubService",
+                (),
+                {"service_name": "tables_db", "service": FailingService()},
+            )(),
+            type(
+                "StubService",
+                (),
+                {"service_name": "users", "service": SuccessfulService()},
+            )(),
+        ]
+
+        validate_services(manager)
+        self.assertEqual(calls, ["tables_db", "users"])
+
+    def test_validate_services_aggregates_failures_across_services(self):
+        class FailingService:
+            def list(self):
+                raise Exception("boom")
+
+        manager = ToolManager()
+        manager.services = [
+            type(
+                "StubService",
+                (),
+                {"service_name": "tables_db", "service": FailingService()},
+            )(),
+            type(
+                "StubService",
+                (),
+                {"service_name": "users", "service": FailingService()},
+            )(),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, r"tables_db: boom[\s\S]*users: boom"):
+            validate_services(manager)
 
     def test_build_operator_uses_explicit_stdio_client(self):
         tool = types.Tool(
@@ -491,6 +829,122 @@ class ServerHelperTests(unittest.TestCase):
         self.assertEqual(captured["code"], "ch")
         self.assertEqual(captured["width"], 1)
         self.assertEqual(captured["height"], 1)
+
+    def test_execute_registered_tool_captures_publishable_appwrite_error(self):
+        tool = types.Tool(
+            name="users_list",
+            description="List users.",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        )
+        manager = ToolManager()
+        manager.tools_registry = {
+            "users_list": {
+                "definition": tool,
+                "service_name": "users",
+                "method_name": "list",
+                "parameter_types": {},
+            }
+        }
+
+        class UsersService:
+            def __init__(self, client):
+                pass
+
+            def list(self):
+                raise AppwriteException("upstream failed", 503, "general_server_error")
+
+        with (
+            patch.dict(server_module.SERVICE_CLASSES, {"users": UsersService}),
+            patch.object(
+                server_module.error_monitoring, "capture_appwrite_exception"
+            ) as capture,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "code=503"):
+                execute_registered_tool(manager, "users_list", {}, client=object())
+
+        capture.assert_called_once()
+        self.assertEqual(capture.call_args.kwargs["service"], "users")
+        self.assertEqual(capture.call_args.kwargs["action"], "list")
+        self.assertIsNone(capture.call_args.kwargs["project_id"])
+
+    def test_execute_registered_tool_passes_target_context_to_appwrite_capture(self):
+        tool = types.Tool(
+            name="users_list",
+            description="List users.",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        )
+        manager = ToolManager()
+        manager.tools_registry = {
+            "users_list": {
+                "definition": tool,
+                "service_name": "users",
+                "method_name": "list",
+                "parameter_types": {},
+            }
+        }
+
+        class UsersService:
+            def __init__(self, client):
+                pass
+
+            def list(self):
+                raise AppwriteException("upstream failed", 503, "general_server_error")
+
+        with (
+            patch.dict(server_module.SERVICE_CLASSES, {"users": UsersService}),
+            patch.object(
+                server_module.error_monitoring, "capture_appwrite_exception"
+            ) as capture,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "code=503"):
+                execute_registered_tool(
+                    manager,
+                    "users_list",
+                    {},
+                    client=object(),
+                    target_project="project-1",
+                    organization_id="org-1",
+                )
+
+        capture.assert_called_once()
+        self.assertEqual(capture.call_args.kwargs["project_id"], "project-1")
+        self.assertEqual(capture.call_args.kwargs["organization_id"], "org-1")
+
+    def test_execute_registered_tool_captures_internal_error(self):
+        tool = types.Tool(
+            name="users_list",
+            description="List users.",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        )
+        manager = ToolManager()
+        manager.tools_registry = {
+            "users_list": {
+                "definition": tool,
+                "service_name": "users",
+                "method_name": "list",
+                "parameter_types": {},
+            }
+        }
+
+        class UsersService:
+            def __init__(self, client):
+                pass
+
+            def list(self):
+                raise RuntimeError("boom")
+
+        with (
+            patch.dict(server_module.SERVICE_CLASSES, {"users": UsersService}),
+            patch.object(
+                server_module.error_monitoring, "capture_exception"
+            ) as capture,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                execute_registered_tool(manager, "users_list", {}, client=object())
+
+        capture.assert_called_once()
+        self.assertEqual(capture.call_args.kwargs["tags"]["appwrite.service"], "users")
+        self.assertIn("context", capture.call_args.kwargs)
 
     def test_parse_args_rejects_removed_flags(self):
         with (

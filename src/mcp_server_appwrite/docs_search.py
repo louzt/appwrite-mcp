@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 import mcp.types as types
 
-from . import telemetry
+from .annotations import annotations_for_classification
 from .constants import (
     DATA_DIR,
     DOCS_DEFAULT_LIMIT,
@@ -43,6 +43,9 @@ Embedder = Callable[[str], list[float]]
 def _default_embedder() -> Embedder | None:
     """Build an OpenAI-backed embedder, or ``None`` if no API key is configured."""
     api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    api_key = "".join(api_key.split())
     if not api_key:
         return None
 
@@ -117,6 +120,9 @@ class DocsSearch:
         return self._vectors is not None and len(self._pages) > 0
 
     def get_tool(self) -> types.Tool:
+        # Read-only local search over the prebuilt docs index; no network
+        # calls beyond the OpenAI embedding call (which is part of the search
+        # query, not a side-effect on user data).
         return types.Tool(
             name=DOCS_TOOL_NAME,
             description=(
@@ -143,6 +149,10 @@ class DocsSearch:
                 "required": ["query"],
                 "additionalProperties": False,
             },
+            # Read-only local search over the prebuilt docs index; no network
+            # calls beyond the OpenAI embedding call (which is part of the search
+            # query, not a side-effect on user data).
+            annotations=annotations_for_classification("read"),
         )
 
     def search(self, arguments: dict[str, Any] | None) -> list[ToolContent]:
@@ -158,12 +168,13 @@ class DocsSearch:
             )
 
         limit = _clamp_limit(arguments.get("limit"), self._default_limit)
-        results, embedding_duration_s = self._rank(query, limit)
-        telemetry.record_search_docs(
-            outcome="success",
-            match_count=len(results),
-            embedding_duration_s=embedding_duration_s,
-        )
+        try:
+            results, _embedding_duration_s = self._rank(query, limit)
+        except Exception as exc:
+            raise RuntimeError(
+                "Documentation search embedding request failed. "
+                "Check OPENAI_API_KEY and outbound connectivity to OpenAI."
+            ) from exc
 
         if not results:
             return [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 from appwrite.models.bucket import Bucket
@@ -14,7 +15,17 @@ from appwrite.models.user import User
 
 # --- server ---------------------------------------------------------------
 
-SERVER_VERSION = "0.8.4"
+
+def _resolve_server_version() -> str:
+    try:
+        return importlib_metadata.version("mcp-server-appwrite")
+    except importlib_metadata.PackageNotFoundError:
+        return "0.0.0+unknown"
+
+
+SERVER_VERSION = _resolve_server_version()
+SERVER_WEBSITE_URL = "https://github.com/appwrite/mcp"
+SERVER_ICON_URL = "https://mcp.appwrite.io/favicon.svg"
 
 DEFAULT_ENDPOINT = "https://cloud.appwrite.io/v1"
 # Region reported by single-region deployments; carries no region subdomain.
@@ -52,12 +63,11 @@ HOSTED_PATH_GUIDANCE = (
 
 DEFAULT_PROJECT_ID = "console"
 
-PREFERRED_SCOPES = [
-    "openid",
-    "profile",
-    "email",
-    "all",
-]
+# Curated scope allowlist. Empty means "no curation": the MCP mirrors the
+# authorization server's full ``scopes_supported`` catalog so clients request
+# every granular scope and the consent screen becomes the narrowing control
+# point. A deployment can still pin a curated set via ``MCP_OAUTH_SCOPES``.
+PREFERRED_SCOPES: list[str] = []
 
 # Shared TTL for cached upstream lookups (OAuth discovery, project regions).
 CACHE_TTL_SECONDS = 300.0
@@ -67,8 +77,12 @@ CACHE_TTL_SECONDS = 300.0
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version",
-    "Access-Control-Expose-Headers": "Mcp-Session-Id, WWW-Authenticate",
+    # Mcp-Method / Mcp-Name are required on 2026-07-28 Streamable HTTP (SEP-2243).
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, "
+        "Mcp-Method, Mcp-Name"
+    ),
+    "Access-Control-Expose-Headers": "Mcp-Session-Id, WWW-Authenticate, Link",
 }
 
 # --- operator -------------------------------------------------------------
@@ -143,3 +157,54 @@ REDACTED_KEYS = {"password", "secret", "key", "token", "otp", "cookie", "session
 # --- telemetry ------------------------------------------------------------
 
 ACTIVE_WINDOW_SECONDS = 300.0  # rolling window for "active users/clients" gauges
+
+# Known MCP clients (normalized: lowercase, whitespace -> "-"). Client names are
+# client-controlled input; anything not matching becomes "other" to bound the
+# client_id label cardinality.
+KNOWN_MCP_CLIENTS = (
+    "5ire",
+    "amp",
+    "bolt",
+    "chatgpt",
+    "cherry-studio",
+    "claude",
+    "claude-ai",
+    "claude-code",
+    "claude-desktop",
+    "cline",
+    "codex",
+    "codex-cli",
+    "continue",
+    "copilot",
+    "crush",
+    "cursor",
+    "deepchat",
+    "fast-agent",
+    "gemini",
+    "gemini-cli",
+    "github-copilot",
+    "goose",
+    "jetbrains",
+    "kilo-code",
+    "kiro",
+    "langchain",
+    "librechat",
+    "lm-studio",
+    "mcp-inspector",
+    "mcphub",
+    "n8n",
+    "opencode",
+    "openai",
+    "raycast",
+    "roo-cline",
+    "roo-code",
+    "tome",
+    "trae",
+    "visual-studio-code",
+    "void",
+    "vscode",
+    "warp",
+    "windsurf",
+    "witsy",
+    "zed",
+)
